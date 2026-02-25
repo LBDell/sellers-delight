@@ -112,29 +112,80 @@ async def identify_furniture_from_image(image_data: bytes, filename: str) -> Fur
 
 async def extract_furniture_from_url(url: str) -> FurnitureItem:
     """Scrape a retailer product page and use Claude to extract furniture details."""
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as http:
-        resp = await http.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-            },
+    page_text = ""
+    scrape_failed = False
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as http:
+            resp = await http.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            resp.raise_for_status()
+            html = resp.text
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Extract meaningful text content
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+
+        page_text = soup.get_text(separator="\n", strip=True)
+        # Truncate to avoid token limits
+        page_text = page_text[:6000]
+    except Exception:
+        scrape_failed = True
+
+    # Many retailer sites (e.g. RH, Crate & Barrel) are JS-rendered SPAs — the
+    # static HTML fetch returns an empty shell.  Fall back to URL-only inference
+    # when the scraped content is too sparse to be useful.
+    content_is_sparse = len(page_text.strip()) < 300
+
+    if scrape_failed or content_is_sparse:
+        prompt_content = (
+            f"A user wants to add a furniture product from this URL to their staging tool:\n{url}\n\n"
+            "The page could not be scraped (it may be a JavaScript-rendered site or bot-protected). "
+            "Use your knowledge of this retailer and any product identifiers in the URL to infer the "
+            "furniture details as accurately as possible.\n\n"
+            "Return ONLY a JSON object:\n"
+            "{\n"
+            '  "name": "product name",\n'
+            '  "type": "one of: sofa, chair, bed, table, desk, dresser, bookshelf, cabinet, wardrobe, coffee_table, dining_table, nightstand, tv_stand, ottoman, bench, other",\n'
+            '  "room": "one of: living_room, bedroom, dining_room, office, bathroom, kitchen, hallway, other",\n'
+            '  "dimensions": {"width": <cm>, "depth": <cm>, "height": <cm>},\n'
+            '  "color": "primary color or color options",\n'
+            '  "material": "primary material",\n'
+            '  "description": "brief one-sentence product description",\n'
+            '  "confidence": <0.0-1.0>\n'
+            "}\n"
+            "Set confidence low (0.3-0.5) if you are guessing. "
+            "Convert any inch measurements to centimeters (1 inch = 2.54 cm). "
+            "Return ONLY valid JSON, no markdown, no extra text."
         )
-        resp.raise_for_status()
-        html = resp.text
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Extract meaningful text content
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-        tag.decompose()
-
-    page_text = soup.get_text(separator="\n", strip=True)
-    # Truncate to avoid token limits
-    page_text = page_text[:6000]
+    else:
+        prompt_content = (
+            f"The following is text scraped from a furniture product page at: {url}\n\n"
+            f"PAGE CONTENT:\n{page_text}\n\n"
+            "Extract furniture details and return ONLY a JSON object:\n"
+            "{\n"
+            '  "name": "product name",\n'
+            '  "type": "one of: sofa, chair, bed, table, desk, dresser, bookshelf, cabinet, wardrobe, coffee_table, dining_table, nightstand, tv_stand, ottoman, bench, other",\n'
+            '  "room": "one of: living_room, bedroom, dining_room, office, bathroom, kitchen, hallway, other",\n'
+            '  "dimensions": {"width": <cm>, "depth": <cm>, "height": <cm>},\n'
+            '  "color": "primary color or color options",\n'
+            '  "material": "primary material",\n'
+            '  "description": "brief one-sentence product description",\n'
+            '  "confidence": <0.0-1.0>\n'
+            "}\n"
+            "Convert any inch measurements to centimeters (1 inch = 2.54 cm). "
+            "Return ONLY valid JSON, no markdown, no extra text."
+        )
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
@@ -142,23 +193,7 @@ async def extract_furniture_from_url(url: str) -> FurnitureItem:
         messages=[
             {
                 "role": "user",
-                "content": (
-                    f"The following is text scraped from a furniture product page at: {url}\n\n"
-                    f"PAGE CONTENT:\n{page_text}\n\n"
-                    "Extract furniture details and return ONLY a JSON object:\n"
-                    "{\n"
-                    '  "name": "product name",\n'
-                    '  "type": "one of: sofa, chair, bed, table, desk, dresser, bookshelf, cabinet, wardrobe, coffee_table, dining_table, nightstand, tv_stand, ottoman, bench, other",\n'
-                    '  "room": "one of: living_room, bedroom, dining_room, office, bathroom, kitchen, hallway, other",\n'
-                    '  "dimensions": {"width": <cm>, "depth": <cm>, "height": <cm>},\n'
-                    '  "color": "primary color or color options",\n'
-                    '  "material": "primary material",\n'
-                    '  "description": "brief one-sentence product description",\n'
-                    '  "confidence": <0.0-1.0>\n'
-                    "}\n"
-                    "Convert any inch measurements to centimeters (1 inch = 2.54 cm). "
-                    "Return ONLY valid JSON, no markdown, no extra text."
-                ),
+                "content": prompt_content,
             }
         ],
     )
