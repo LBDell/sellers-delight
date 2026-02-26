@@ -112,29 +112,76 @@ async def identify_furniture_from_image(image_data: bytes, filename: str) -> Fur
 
 async def extract_furniture_from_url(url: str) -> FurnitureItem:
     """Scrape a retailer product page and use Claude to extract furniture details."""
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as http:
-        resp = await http.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-            },
-        )
-        resp.raise_for_status()
-        html = resp.text
+    page_context = ""
 
-    soup = BeautifulSoup(html, "html.parser")
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as http:
+            resp = await http.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Cache-Control": "max-age=0",
+                },
+            )
+            resp.raise_for_status()
+            html = resp.text
 
-    # Extract meaningful text content
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-        tag.decompose()
+        soup = BeautifulSoup(html, "html.parser")
 
-    page_text = soup.get_text(separator="\n", strip=True)
-    # Truncate to avoid token limits
-    page_text = page_text[:6000]
+        # Prefer machine-readable structured data (JSON-LD) when available
+        json_ld_parts: list[str] = []
+        for script in soup.find_all("script", type="application/ld+json"):
+            json_ld_parts.append(script.get_text(strip=True))
+        json_ld_text = "\n".join(json_ld_parts)[:3000]
+
+        # Collect useful <meta> tags (Open Graph, standard description)
+        meta_parts: list[str] = []
+        for prop in ("og:title", "og:description", "product:price:amount"):
+            tag = soup.find("meta", {"property": prop})
+            if tag and tag.get("content"):
+                meta_parts.append(f"{prop}: {tag['content']}")
+        for name in ("description", "keywords"):
+            tag = soup.find("meta", {"name": name})
+            if tag and tag.get("content"):
+                meta_parts.append(f"{name}: {tag['content']}")
+        meta_text = "\n".join(meta_parts)
+
+        # Fall back to visible body text when structured data is sparse
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        body_text = soup.get_text(separator="\n", strip=True)[:4000]
+
+        sections: list[str] = []
+        if json_ld_text.strip():
+            sections.append(f"STRUCTURED DATA (JSON-LD):\n{json_ld_text}")
+        if meta_text.strip():
+            sections.append(f"META TAGS:\n{meta_text}")
+        if body_text.strip():
+            sections.append(f"PAGE TEXT:\n{body_text}")
+        page_context = "\n\n".join(sections)
+
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        # Site blocked scraping or request failed; Claude will infer from the URL path.
+        page_context = ""
+
+    content_block = (
+        f"PAGE CONTENT:\n{page_context}\n\n"
+        if page_context.strip()
+        else "Note: page content could not be retrieved. Infer the product from the URL path.\n\n"
+    )
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
@@ -143,9 +190,9 @@ async def extract_furniture_from_url(url: str) -> FurnitureItem:
             {
                 "role": "user",
                 "content": (
-                    f"The following is text scraped from a furniture product page at: {url}\n\n"
-                    f"PAGE CONTENT:\n{page_text}\n\n"
-                    "Extract furniture details and return ONLY a JSON object:\n"
+                    f"Extract furniture product details from this retailer URL: {url}\n\n"
+                    + content_block
+                    + "Return ONLY a JSON object:\n"
                     "{\n"
                     '  "name": "product name",\n'
                     '  "type": "one of: sofa, chair, bed, table, desk, dresser, bookshelf, cabinet, wardrobe, coffee_table, dining_table, nightstand, tv_stand, ottoman, bench, other",\n'
@@ -157,6 +204,7 @@ async def extract_furniture_from_url(url: str) -> FurnitureItem:
                     '  "confidence": <0.0-1.0>\n'
                     "}\n"
                     "Convert any inch measurements to centimeters (1 inch = 2.54 cm). "
+                    "Use sensible defaults for any values you cannot determine. "
                     "Return ONLY valid JSON, no markdown, no extra text."
                 ),
             }
